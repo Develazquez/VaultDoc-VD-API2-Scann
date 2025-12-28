@@ -18,30 +18,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# IMPORTA DESPUÉS DE CREAR APP
+
 from controllers.scan_controller import router as scan_router
 app.include_router(scan_router, prefix="/api/scan", tags=["Scan"])
 
-# Debug: Ver rutas registradas
-@app.on_event("startup")
-async def startup_event():
-    print("\n=== RUTAS REGISTRADAS ===")
-    for route in app.routes:
-        if hasattr(route, 'methods'):
-            print(f"{route.methods} {route.path}")
-    print("========================\n")
 
-@app.get("/")
-def read_root():
-    return {
-        "message": "VaultDoc Scanner API",
-        "version": "1.0.0",
-        "status": "running"
-    }
-
-@app.get("/health")
-def health_check():
-    return {"status": "healthy"}
 
 if __name__ == "__main__":
     uvicorn.run(
