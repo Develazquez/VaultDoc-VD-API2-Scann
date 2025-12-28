@@ -23,13 +23,17 @@ async def scan_single_document(
     id_uploader: int = Form(...),
     departamento: str = Form(...)
 ):
-    """
-    Escanea una sola imagen y la sube al sistema
-    """
+
     try:
+        
+        logger.info(f"Folio: {folio}, Carpeta: {id_folder}, Usuario: {id_uploader}")
+        logger.info(f"Departamento: {departamento}, Archivo: {file.filename}")
+        
+       
         if not file.content_type.startswith('image/'):
             raise HTTPException(status_code=400, detail="El archivo debe ser una imagen")
         
+       
         image_bytes = await file.read()
         
         if len(image_bytes) > settings.MAX_FILE_SIZE:
@@ -38,11 +42,11 @@ async def scan_single_document(
                 detail=f"El archivo excede el tamaño máximo permitido ({settings.MAX_FILE_SIZE / 1024 / 1024}MB)"
             )
         
-        # Verificar si el folio ya existe
+        
         if file_service.check_file_exists(folio):
             raise HTTPException(status_code=400, detail=f"Ya existe un archivo con el folio {folio}")
         
-        # Obtener información de la carpeta
+       
         folder_info = file_service.get_folder_info(id_folder, departamento)
         if not folder_info:
             raise HTTPException(
@@ -50,41 +54,42 @@ async def scan_single_document(
                 detail=f"Carpeta con ID {id_folder} no encontrada en el departamento {departamento}"
             )
         
-        # Procesar imagen (detectar bordes, corregir perspectiva, mejorar calidad)
-        processed_image_bytes, extension = image_processor.process_image(
+        
+        logger.info("Procesando imagen y generando PDF...")
+        processed_pdf_bytes, extension = image_processor.process_image(
             image_bytes,
             max_height=settings.MAX_IMAGE_HEIGHT
         )
         
-        # Generar nombre del archivo
         base_name = file_service.generate_file_name(folio, departamento)
         file_name = f"{base_name}.{extension}"
         
-        # Construir ruta de carpeta
         folder_path = f"{departamento}/{folder_info['name']}"
         
-        # Verificar si el archivo ya existe en Nextcloud
         if nextcloud_client.file_exists(folder_path, file_name):
             raise HTTPException(
                 status_code=400,
                 detail=f"El archivo {file_name} ya existe en Nextcloud en {folder_path}"
             )
         
+        
+        logger.info(f"Subiendo PDF a Nextcloud: {folder_path}/{file_name}")
         try:
             relative_path = nextcloud_client.upload_file(
-                processed_image_bytes,
+                processed_pdf_bytes,
                 folder_path,
                 file_name
             )
         except Exception as e:
-            logger.error(f"Error al subir archivo a Nextcloud: {e}")
-            raise HTTPException(status_code=500, detail="Error al subir archivo a Nextcloud")
+            logger.error(f"Error al subir PDF a Nextcloud: {e}")
+            raise HTTPException(status_code=500, detail=f"Error al subir PDF a Nextcloud: {str(e)}")
         
+        logger.info("Creando registro en la base de datos...")
         try:
             file_id = file_service.create_file_record(
                 departamento=departamento,
                 nombre=file_name,
-                tamano=len(processed_image_bytes),
+                tamano=len(processed_pdf_bytes),
                 fecha=datetime.now().strftime("%Y-%m-%d"),
                 folio=folio,
                 extension=extension,
@@ -93,18 +98,22 @@ async def scan_single_document(
                 directorio=relative_path
             )
         except Exception as e:
+            
             nextcloud_client.delete_file(folder_path, file_name)
             logger.error(f"Error al crear registro en BD: {e}")
             raise HTTPException(status_code=500, detail="Error al crear registro en base de datos")
         
-        # Otorgar permisos automáticos
+        
         try:
             file_service.grant_automatic_permissions(file_id, id_uploader, departamento)
+            logger.info("Permisos automáticos otorgados")
         except Exception as e:
             logger.warning(f"Error al otorgar permisos automáticos: {e}")
         
+        logger.info(f"✅ PDF creado exitosamente: {file_name}")
+        
         return ScanResponse(
-            message="Documento escaneado y subido exitosamente",
+            message="Documento escaneado y convertido a PDF exitosamente",
             file_id=file_id,
             file_name=file_name,
             file_path=relative_path,
@@ -117,6 +126,7 @@ async def scan_single_document(
         logger.error(f"Error inesperado al escanear documento: {e}")
         raise HTTPException(status_code=500, detail=f"Error al procesar el documento: {str(e)}")
 
+
 @router.post("/multiple", response_model=ScanResponse)
 async def scan_multiple_documents(
     files: List[UploadFile] = File(...),
@@ -125,10 +135,15 @@ async def scan_multiple_documents(
     id_uploader: int = Form(...),
     departamento: str = Form(...)
 ):
-
+   
     try:
+        
+        logger.info(f"Folio base: {folio_base}, Carpeta: {id_folder}, Usuario: {id_uploader}")
+        logger.info(f"Departamento: {departamento}, Número de archivos: {len(files)}")
+        
         if len(files) == 0:
-            raise HTTPException(status_code=400, detail="Debe proporcionar al menos una imagen")
+            raise HTTPException(status_code=400, detail="Debe subir por lo menos una imagen")
+        
         
         folder_info = file_service.get_folder_info(id_folder, departamento)
         if not folder_info:
@@ -138,11 +153,13 @@ async def scan_multiple_documents(
             )
         
         folder_path = f"{departamento}/{folder_info['name']}"
-        uploaded_files = []
-        file_ids = []
+        
+        
+        images_to_process = []
         
         for idx, file in enumerate(files, start=1):
             if not file.content_type.startswith('image/'):
+                logger.warning(f"Archivo {idx} no es una imagen, omitiendo")
                 continue
             
             image_bytes = await file.read()
@@ -151,62 +168,81 @@ async def scan_multiple_documents(
                 logger.warning(f"Archivo {idx} excede tamaño máximo, omitiendo")
                 continue
             
-            folio = f"{folio_base}-{idx}"
-            
-            if file_service.check_file_exists(folio):
-                logger.warning(f"Folio {folio} ya existe, omitiendo")
-                continue
-            
-            processed_image_bytes, extension = image_processor.process_image(
-                image_bytes,
+            images_to_process.append(image_bytes)
+        
+        if len(images_to_process) == 0:
+            raise HTTPException(status_code=400, detail="No hay imágenes válidas para procesar")
+        
+        
+        if file_service.check_file_exists(folio_base):
+            raise HTTPException(status_code=400, detail=f"Ya existe un archivo con el folio {folio_base}")
+        
+       
+        logger.info(f"Procesando {len(images_to_process)} imágenes y generando PDF múltiple...")
+        try:
+            pdf_bytes = image_processor.process_multiple_images_to_pdf(
+                images_to_process,
                 max_height=settings.MAX_IMAGE_HEIGHT
             )
-            
-            base_name = file_service.generate_file_name(folio, departamento)
-            file_name = f"{base_name}.{extension}"
-            
-            try:
-                relative_path = nextcloud_client.upload_file(
-                    processed_image_bytes,
-                    folder_path,
-                    file_name
-                )
-            except Exception as e:
-                logger.error(f"Error al subir archivo {idx}: {e}")
-                continue
-            
-            try:
-                file_id = file_service.create_file_record(
-                    departamento=departamento,
-                    nombre=file_name,
-                    tamano=len(processed_image_bytes),
-                    fecha=datetime.now().strftime("%Y-%m-%d"),
-                    folio=folio,
-                    extension=extension,
-                    id_folder=id_folder,
-                    id_uploader=id_uploader,
-                    directorio=relative_path
-                )
-                
-                # Otorgar permisos
-                file_service.grant_automatic_permissions(file_id, id_uploader, departamento)
-                
-                uploaded_files.append(file_name)
-                file_ids.append(file_id)
-                
-            except Exception as e:
-                nextcloud_client.delete_file(folder_path, file_name)
-                logger.error(f"Error al crear registro para archivo {idx}: {e}")
-                continue
+        except Exception as e:
+            logger.error(f"Error al procesar imágenes múltiples: {e}")
+            raise HTTPException(status_code=500, detail=f"Error al procesar imágenes: {str(e)}")
         
-        if len(uploaded_files) == 0:
-            raise HTTPException(status_code=400, detail="No se pudo procesar ninguna imagen")
+        
+        base_name = file_service.generate_file_name(folio_base, departamento)
+        file_name = f"{base_name}.pdf"
+        
+        
+        if nextcloud_client.file_exists(folder_path, file_name):
+            raise HTTPException(
+                status_code=400,
+                detail=f"El archivo {file_name} ya existe en Nextcloud en {folder_path}"
+            )
+        
+        
+        logger.info(f"Subiendo PDF de múltiples imagenes a Nextcloud: {folder_path}/{file_name}")
+        try:
+            relative_path = nextcloud_client.upload_file(
+                pdf_bytes,
+                folder_path,
+                file_name
+            )
+        except Exception as e:
+            logger.error(f"Error al subir PDF múltiple: {e}")
+            raise HTTPException(status_code=500, detail=f"Error al subir PDF a Nextcloud: {str(e)}")
+        
+        # Crear UN SOLO registro en la BD para el PDF completo
+        logger.info("Creando registro en base de datos...")
+        try:
+            file_id = file_service.create_file_record(
+                departamento=departamento,
+                nombre=file_name,
+                tamano=len(pdf_bytes),
+                fecha=datetime.now().strftime("%Y-%m-%d"),
+                folio=folio_base,
+                extension="pdf",
+                id_folder=id_folder,
+                id_uploader=id_uploader,
+                directorio=relative_path
+            )
+            
+            # Otorgar permisos
+            file_service.grant_automatic_permissions(file_id, id_uploader, departamento)
+            logger.info("Permisos automáticos otorgados")
+            
+        except Exception as e:
+            # Revertir subida a Nextcloud
+            nextcloud_client.delete_file(folder_path, file_name)
+            logger.error(f"Error al crear registro para PDF múltiple: {e}")
+            raise HTTPException(status_code=500, detail="Error al crear registro en base de datos")
+        
+        logger.info(f"PDF múltiple creado exitosamente: {file_name} con {len(images_to_process)} páginas")
         
         return ScanResponse(
-            message=f"{len(uploaded_files)} documentos escaneados y subidos exitosamente",
-            file_id=file_ids[0] if file_ids else None,
-            file_name=", ".join(uploaded_files),
-            file_path=folder_path,
+            message=f"PDF creado con {len(images_to_process)} páginas procesadas",
+            file_id=file_id,
+            file_name=file_name,
+            file_path=relative_path,
             success=True
         )
         
@@ -216,11 +252,32 @@ async def scan_multiple_documents(
         logger.error(f"Error inesperado al escanear múltiples documentos: {e}")
         raise HTTPException(status_code=500, detail=f"Error al procesar los documentos: {str(e)}")
 
-@router.get("/health")
-async def health_check():
-    """Verifica el estado del servicio"""
+
+
+
+""" 
+Enpdpoint opcional para debuging
+@router.post("/debug")
+async def debug_request(
+    file: UploadFile = File(None),
+    folio: str = Form(None),
+    id_folder: str = Form(None),
+    id_uploader: str = Form(None),
+    departamento: str = Form(None)
+):
+
+    logger.info(f"file: {file.filename if file else 'None'}")
+    logger.info(f"folio: {folio}")
+    logger.info(f"id_folder: {id_folder}")
+    logger.info(f"id_uploader: {id_uploader}")
+    logger.info(f"departamento: {departamento}")
+    
     return {
-        "status": "healthy",
-        "service": "scanner",
-        "timestamp": datetime.now().isoformat()
+        "file": file.filename if file else None,
+        "folio": folio,
+        "id_folder": id_folder,
+        "id_uploader": id_uploader,
+        "departamento": departamento
     }
+
+"""
