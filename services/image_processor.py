@@ -7,6 +7,7 @@ from typing import Tuple, List, Dict
 import logging
 import img2pdf
 from services.ocr_service import OCRService
+from services.opencv_service import OpenCVService
 
 logger = logging.getLogger(__name__)
 
@@ -132,14 +133,18 @@ class ImageProcessor:
         enhanced = cv2.fastNlMeansDenoising(enhanced, None, 10, 7, 21)
         
         return enhanced
+
+    def bytes_to_cv2(self, image_bytes: bytes) -> np.ndarray:
+        nparr = np.frombuffer(image_bytes, np.uint8)
+        return cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+
     
     @staticmethod
     def process_image_to_bytes(image_bytes: bytes, max_height: int = 1500) -> bytes:
 
         try:
             # Decodificar imagen desde bytes
-            nparr = np.frombuffer(image_bytes, np.uint8)
-            image = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+            image = ImageProcessor.bytes_to_cv2(image_bytes)
             
             if image is None:
                 raise ValueError("No se pudo decodificar la imagen")
@@ -230,3 +235,71 @@ class ImageProcessor:
         except Exception as e:
             logger.error(f"Error al generar PDF múltiple: {e}")
             raise ValueError(f"Error al generar PDF múltiple: {str(e)}")
+        
+    def scan_document(self, image: np.ndarray) -> np.ndarray:
+        corners = OpenCVService.detect_document_corners(image)
+
+        if len(corners) == 4:
+            warped = OpenCVService.perspective_transform(image, corners)
+            enhanced = OpenCVService.enhance_for_scan(warped)
+            return enhanced
+
+        return image
+    
+    def detect_corners(self, image: np.ndarray):
+        return OpenCVService.detect_document_corners(image)
+    
+    def apply_perspective_transform(self, image_bytes: bytes, points: List[Tuple[float, float]]) -> str:
+        """
+        Aplica transformación de perspectiva a una imagen usando 4 puntos dados.
+        
+        Args:
+            image_bytes: Bytes de la imagen original
+            points: Lista de 4 puntos [(x1,y1), (x2,y2), (x3,y3), (x4,y4)]
+        
+        Returns:
+            Imagen transformada en formato base64 (data URI) para renderizar en frontend
+        """
+        try:
+            # Decodificar imagen
+            image = self.bytes_to_cv2(image_bytes)
+            
+            if image is None:
+                raise ValueError("No se pudo decodificar la imagen")
+            
+            logger.info(f"Imagen original: {image.shape[1]}x{image.shape[0]} px")
+            logger.info(f"Puntos recibidos: {points}")
+            
+            # Convertir puntos a formato numpy
+            pts = np.array(points, dtype="float32")
+            
+            # Ordenar puntos (tl, tr, br, bl)
+            ordered_pts = ImageProcessor.order_points(pts)
+            
+            # Aplicar transformación de perspectiva
+            logger.info("Aplicando transformación de perspectiva...")
+            warped = ImageProcessor.four_point_transform(image, ordered_pts)
+            
+            logger.info(f"Imagen transformada: {warped.shape[1]}x{warped.shape[0]} px")
+            
+            # Codificar imagen a PNG
+            success, encoded_image = cv2.imencode('.png', warped)
+            
+            if not success:
+                raise ValueError("Error al codificar la imagen")
+            
+            # Convertir a base64
+            import base64
+            base64_image = base64.b64encode(encoded_image.tobytes()).decode('utf-8')
+            
+            # Devolver como data URI para uso directo en HTML/Angular
+            data_uri = f"data:image/png;base64,{base64_image}"
+            
+            logger.info(f"Imagen convertida a base64: {len(data_uri)} caracteres")
+            
+            return data_uri
+            
+        except Exception as e:
+            logger.error(f"Error en transformación de perspectiva: {e}")
+            raise ValueError(f"Error al transformar imagen: {str(e)}")
+

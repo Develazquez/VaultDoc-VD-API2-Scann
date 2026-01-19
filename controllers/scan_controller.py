@@ -1,9 +1,12 @@
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException
+from fastapi.responses import JSONResponse
 from typing import List
 from datetime import datetime
 import logging
+import json
 
 from models.file_model import ScanRequest, ScanResponse
+from models.scan_points_model import Point, PerspectiveScanRequest
 from services.image_processor import ImageProcessor
 from services.file_service import FileService
 from services.nextcloud_client import nextcloud_client
@@ -273,3 +276,277 @@ async def health_check():
         "timestamp": datetime.now().isoformat()
     }
 
+@router.post("/detect-corners")
+async def detect_corners(file: UploadFile = File(...)):
+
+    if not file.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="Debe ser una imagen")
+
+    image_bytes = await file.read()
+
+    image = image_processor.bytes_to_cv2(image_bytes)
+    corners = image_processor.detect_corners(image)
+
+    if not corners:
+        return {"found": False, "corners": []}
+
+    return {"found": True, "corners": corners}
+
+
+@router.post("/transform-perspective")
+async def transform_perspective(
+    file: UploadFile = File(...),
+    points: str = Form(...)
+):
+    """
+    Aplica transformación de perspectiva a una imagen usando 4 puntos.
+    
+    Args:
+        file: Imagen a transformar
+        points: JSON string con array de 4 puntos [{"x": float, "y": float}, ...]
+               Orden esperado: top-left, top-right, bottom-right, bottom-left
+    
+    Returns:
+        JSON con la imagen transformada en formato base64 (data URI)
+        para renderizar directamente en Angular con <img [src]="imageData">
+    """
+    try:
+        # Validar tipo de archivo
+        if not file.content_type.startswith("image/"):
+            raise HTTPException(status_code=400, detail="El archivo debe ser una imagen")
+        
+        # Parsear los puntos desde JSON
+        try:
+            points_data = json.loads(points)
+            if len(points_data) != 4:
+                raise HTTPException(
+                    status_code=400, 
+                    detail="Se requieren exactamente 4 puntos"
+                )
+            
+            # Convertir a lista de tuplas
+            point_tuples = [(p["x"], p["y"]) for p in points_data]
+            
+        except json.JSONDecodeError:
+            raise HTTPException(
+                status_code=400, 
+                detail="Formato de puntos inválido. Debe ser JSON: [{\"x\": 0, \"y\": 0}, ...]"
+            )
+        except KeyError:
+            raise HTTPException(
+                status_code=400, 
+                detail="Cada punto debe tener propiedades 'x' e 'y'"
+            )
+        
+        # Leer imagen
+        image_bytes = await file.read()
+        
+        if len(image_bytes) > settings.MAX_FILE_SIZE:
+            raise HTTPException(
+                status_code=400,
+                detail=f"El archivo excede el tamaño máximo permitido ({settings.MAX_FILE_SIZE / 1024 / 1024}MB)"
+            )
+        
+        # Aplicar transformación
+        logger.info(f"Aplicando transformación de perspectiva con puntos: {point_tuples}")
+        
+        transformed_image_base64 = image_processor.apply_perspective_transform(
+            image_bytes, 
+            point_tuples
+        )
+        
+        return JSONResponse(content={
+            "success": True,
+            "message": "Imagen transformada exitosamente",
+            "image": transformed_image_base64
+        })
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error al transformar perspectiva: {e}")
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Error al procesar la transformación: {str(e)}"
+        )
+
+
+@router.post("/detect-corners-multiple")
+async def detect_corners_multiple(files: List[UploadFile] = File(...)):
+    """
+    Detecta las esquinas de múltiples imágenes.
+    
+    Args:
+        files: Lista de imágenes a procesar
+    
+    Returns:
+        JSON con array de resultados, cada uno con las esquinas detectadas
+        [{"index": 0, "filename": "img.jpg", "found": true, "corners": [...]}, ...]
+    """
+    try:
+        if len(files) == 0:
+            raise HTTPException(status_code=400, detail="Debe proporcionar al menos una imagen")
+        
+        results = []
+        
+        for idx, file in enumerate(files):
+            result = {
+                "index": idx,
+                "filename": file.filename,
+                "found": False,
+                "corners": []
+            }
+            
+            # Validar tipo de archivo
+            if not file.content_type.startswith("image/"):
+                result["error"] = "No es una imagen válida"
+                results.append(result)
+                continue
+            
+            try:
+                image_bytes = await file.read()
+                
+                if len(image_bytes) > settings.MAX_FILE_SIZE:
+                    result["error"] = "Archivo excede tamaño máximo"
+                    results.append(result)
+                    continue
+                
+                image = image_processor.bytes_to_cv2(image_bytes)
+                corners = image_processor.detect_corners(image)
+                
+                if corners:
+                    result["found"] = True
+                    result["corners"] = corners
+                
+            except Exception as e:
+                logger.warning(f"Error procesando imagen {idx}: {e}")
+                result["error"] = str(e)
+            
+            results.append(result)
+        
+        found_count = sum(1 for r in results if r["found"])
+        
+        return JSONResponse(content={
+            "success": True,
+            "total": len(files),
+            "detected": found_count,
+            "results": results
+        })
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error al detectar esquinas múltiples: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error al procesar las imágenes: {str(e)}"
+        )
+
+
+@router.post("/transform-perspective-multiple")
+async def transform_perspective_multiple(
+    files: List[UploadFile] = File(...),
+    points_list: str = Form(...)
+):
+    """
+    Aplica transformación de perspectiva a múltiples imágenes.
+    
+    Args:
+        files: Lista de imágenes a transformar
+        points_list: JSON string con array de arrays de 4 puntos para cada imagen
+                    [[{"x": float, "y": float}, ...], [...], ...]
+                    Debe haber un array de 4 puntos por cada imagen
+    
+    Returns:
+        JSON con array de imágenes transformadas en formato base64 (data URI)
+        para renderizar directamente en Angular
+    """
+    try:
+        if len(files) == 0:
+            raise HTTPException(status_code=400, detail="Debe proporcionar al menos una imagen")
+        
+        # Parsear los puntos desde JSON
+        try:
+            all_points_data = json.loads(points_list)
+            
+            if len(all_points_data) != len(files):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"El número de conjuntos de puntos ({len(all_points_data)}) debe coincidir con el número de imágenes ({len(files)})"
+                )
+            
+        except json.JSONDecodeError:
+            raise HTTPException(
+                status_code=400,
+                detail="Formato de puntos inválido. Debe ser JSON: [[{\"x\": 0, \"y\": 0}, ...], ...]"
+            )
+        
+        results = []
+        
+        for idx, (file, points_data) in enumerate(zip(files, all_points_data)):
+            result = {
+                "index": idx,
+                "filename": file.filename,
+                "success": False,
+                "image": None
+            }
+            
+            # Validar tipo de archivo
+            if not file.content_type.startswith("image/"):
+                result["error"] = "No es una imagen válida"
+                results.append(result)
+                continue
+            
+            # Validar puntos
+            if len(points_data) != 4:
+                result["error"] = "Se requieren exactamente 4 puntos"
+                results.append(result)
+                continue
+            
+            try:
+                # Convertir a lista de tuplas
+                point_tuples = [(p["x"], p["y"]) for p in points_data]
+                
+                image_bytes = await file.read()
+                
+                if len(image_bytes) > settings.MAX_FILE_SIZE:
+                    result["error"] = "Archivo excede tamaño máximo"
+                    results.append(result)
+                    continue
+                
+                logger.info(f"Transformando imagen {idx} con puntos: {point_tuples}")
+                
+                transformed_image_base64 = image_processor.apply_perspective_transform(
+                    image_bytes,
+                    point_tuples
+                )
+                
+                result["success"] = True
+                result["image"] = transformed_image_base64
+                
+            except KeyError:
+                result["error"] = "Cada punto debe tener propiedades 'x' e 'y'"
+            except Exception as e:
+                logger.warning(f"Error transformando imagen {idx}: {e}")
+                result["error"] = str(e)
+            
+            results.append(result)
+        
+        success_count = sum(1 for r in results if r["success"])
+        
+        return JSONResponse(content={
+            "success": True,
+            "total": len(files),
+            "transformed": success_count,
+            "message": f"{success_count} de {len(files)} imágenes transformadas exitosamente",
+            "results": results
+        })
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error al transformar perspectiva múltiple: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error al procesar las transformaciones: {str(e)}"
+        )
